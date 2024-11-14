@@ -16,7 +16,7 @@ Refer to the papers https://arxiv.org/pdf/2405.11157, https://arxiv.org/abs/2402
 
 MTTL offers some quick code to train some experts for FLAN and storing them into an "Expert Library". An expert library contains a list of experts and their parameters and that can be stored locally, on HF or on Azure.
 
-The following code trains 8 experts on a subset of data from FLAN (with subsampled examples for each expert) and store them in a local library.
+The following code trains 10 experts on a subset of data from FLAN (with subsampled examples for each expert) and store them in a local library.
 
 If you don't want to execute the following code, you can alternatively create the local expert library from a pretrained library we provide in `sordonia/trained_gpt125m_experts_colab` (see code below).
 
@@ -184,7 +184,6 @@ if train_library:
         )
 
         # minimal training code to finetune the model on examples from the task
-        print(train_mbc_config.finetune_task_name)
         dm = get_datamodule(train_mbc_config)
         print(len(dm.train_dataset) // train_mbc_config.train_batch_size)
         train_model(train_mbc_config, model, dm)
