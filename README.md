@@ -47,7 +47,7 @@ train_config = ExpertConfig.from_dict(
         "trainable_param_names": ".*lora_[ab].*",
         "num_train_epochs": 5,
         "learning_rate": 1e-2,
-        "micro_batch_size": 4,
+        "micro_batch_size": 16,
         "train_batch_size": 16,
         "predict_batch_size": 8,
         "precision": "bf16",
@@ -784,7 +784,3 @@ plt.show()
 
     
 ![png](pg_mbc_arrow_tutorial_files/pg_mbc_arrow_tutorial_23_0.png)
-    
-
-
-Arrow increased performance on Arc-Easy from .3868 -> .4028
