@@ -1,17 +1,15 @@
-# MBC + Arrow using microsoft/MTTL
+# MBC, Arrow, PhatGOOSE using microsoft/MTTL
 
-In this notebook, we will show how to use our repo (https://github.com/microsoft/mttl.git) to train experts, do MBC clustering and then apply Arrow routing algorithms to downstream tasks.
+Zero-shot re-use of Parameter-Efficient experts has been tackled in two recent concurrent papers: PhatGOOSE (https://arxiv.org/abs/2402.05859) and Arrow (https://arxiv.org/pdf/2405.11157). In this notebook, we will give a brief overview on how to produce similar results to these papers thanks to the library `https://github.com/microsoft/mttl` which makes it easy to manage and route parameter-efficient experts.
 
-Refer to the paper https://arxiv.org/pdf/2405.11157 for more details!
+We will also show MBC as a way of clustering experts and re-training experts on similar tasks.
+
+Refer to the papers https://arxiv.org/pdf/2405.11157, https://arxiv.org/abs/2402.05859, or to our survey https://www.arxiv.org/pdf/2408.07057 for more details!
 
 
 ```python
-# let's install MTTL first, and clone it to have access to sample scripts
-
+# let's install MTTL first
 !pip install git+https://github.com/microsoft/mttl
-!pip install triton
-!pip install huggingface_hub --upgrade
-!git clone https://github.com/microsoft/mttl.git
 ```
 
 # Training Experts
@@ -24,134 +22,103 @@ If you don't want to execute the following code, you can alternatively create th
 
 
 ```python
-#############################
-# OPTIONAL -- DO NOT EXECUTE
-#############################
+# here, we train experts and we upload them to a local library (repository) of experts.
 
-%%bash
+import os
+from mttl.arguments import ExpertConfig
+from mttl.datamodule.base import get_datamodule
+from mttl.models.library.expert_library import ExpertLibrary
+from mttl.models.expert_model import ExpertModel, ExpertModelConfig
+from mttl.models.train_utils import train_model
 
-TASKS=(
-    "wiqa_what_is_the_final_step_of_the_following_process"
-    "sciq_Multiple_Choice"
-    "adversarial_qa_droberta_answer_the_following_q"
-    "duorc_SelfRC_question_answering"
-    "cos_e_v1_11_description_question_option_id"
-    "wiki_qa_Is_This_True_"
-    "quail_description_context_question_text"
-    "wiki_hop_original_explain_relation"
+# Set this flag to True if you want to re-train the experts!
+train_library = False
+
+train_config = ExpertConfig.from_dict(
+    {
+        "lora_rank": 4,
+        "lora_alpha": 1.,
+        "lora_dropout": 0.0,
+        "weight_decay": 0.0,
+        "output_dir": "/tmp/",
+        "model_modifier": "lora",
+        "modify_modules": ".*",
+        "modify_layers": "q_proj|v_proj|k_proj",
+        "trainable_param_names": ".*lora_[ab].*",
+        "num_train_epochs": 5,
+        "learning_rate": 1e-2,
+        "micro_batch_size": 4,
+        "train_batch_size": 16,
+        "predict_batch_size": 8,
+        "precision": "bf16",
+        "model": "EleutherAI/gpt-neo-125m",
+        "model_family": "gpt",
+        "optimizer": "adamw",
+        "dataset": "sordonia/flan-100-flat",
+        "warmup_proportion": 0.,
+        "max_input_length": 1024,
+        "max_output_length": 128,
+        "truncation_side": "left"
+    }
 )
 
-for TASK in "${TASKS[@]}"
-do
-  echo "Processing: $TASK"
-  python mttl/projects/modular_llm/train_experts.py -c mttl/projects/modular_llm/configs/models/gptneo_125m_fast.json \
-  -k finetune_task_name=$TASK \
-  -k library_id=local://trained_gpt125m_experts_colab
-done
-```
+if train_library:
+    library = ExpertLibrary.get_expert_library("local://trained_gpt125m_experts_colab", create=True)
 
-
-```python
-# let's load the library and see its contents
-import os
-from mttl.models.library.expert_library import ExpertLibrary
-
-if not os.path.exists("trained_gpt125m_experts_colab"):
-    library = ExpertLibrary.get_expert_library("hf://sordonia/trained_gpt125m_experts_colab")
-
-    # let's create a local clone of this library! This step is not necessary if we trained experts above!
-    library = library.clone("local://trained_gpt125m_experts_colab")
+    for task in [
+        "wiqa_what_is_the_final_step_of_the_following_process",
+        "sciq_Multiple_Choice",
+        "adversarial_qa_droberta_answer_the_following_q",
+        "duorc_SelfRC_question_answering",
+        "cos_e_v1_11_description_question_option_id",
+        "race_high_Select_the_best_answer",
+        "race_high_Select_the_best_answer_generate_span_",
+        "wiki_qa_Is_This_True_",
+        "quail_description_context_question_text",
+        "wiki_hop_original_explain_relation"
+    ]:
+        # set the task name to the task we want to finetune on
+        train_config.finetune_task_name = task
+        # initialize an expert model
+        model = ExpertModel(
+            ExpertModelConfig(
+                base_model=train_config.model,
+                expert_name=train_config.finetune_task_name,
+                task_name=train_config.finetune_task_name,
+                modifier_config=train_config.modifier_config,
+            ),
+            device_map="cuda",
+            precision=train_config.precision,
+        )
+        # minimal training code to finetune the model on examples from the task
+        train_model(train_config, model, get_datamodule(train_config))
+        # add the expert to the library!
+        expert_instance = model.as_expert(training_config=train_config.to_dict())
+        library.add_expert(expert_instance, force=True)
 else:
-    library = ExpertLibrary.get_expert_library("local://trained_gpt125m_experts_colab")
+    library = ExpertLibrary.get_expert_library("hf://sordonia/trained_gpt125m_experts_colab").clone("local://trained_gpt125m_experts_colab")
+
 
 # Let's see which experts are in the library... :-)
 for expert_name in library.keys():
     print("Expert: ", expert_name, " with config: ", library[expert_name].expert_config)
+print("Experts in library:", len(library))
 ```
-
-    /usr/local/lib/python3.10/dist-packages/huggingface_hub/utils/_auth.py:94: UserWarning: 
-    The secret `HF_TOKEN` does not exist in your Colab secrets.
-    To authenticate with the Hugging Face Hub, create a token in your settings tab (https://huggingface.co/settings/tokens), set it as secret in your Google Colab and restart your session.
-    You will be able to reuse this secret in all of your notebooks.
-    Please note that authentication is recommended but still optional to access public models or datasets.
-      warnings.warn(
-
-
-
-    duorc_SelfRC_question_answering.meta:   0%|          | 0.00/4.90k [00:00<?, ?B/s]
-
-
-
-    (…)_qa_droberta_answer_the_following_q.meta:   0%|          | 0.00/4.90k [00:00<?, ?B/s]
-
-
-
-    (…)l_description_context_question_text.meta:   0%|          | 0.00/4.90k [00:00<?, ?B/s]
-
-
-
-    (…)1_11_description_question_option_id.meta:   0%|          | 0.00/4.90k [00:00<?, ?B/s]
-
-
-
-    sciq_Multiple_Choice.meta:   0%|          | 0.00/4.90k [00:00<?, ?B/s]
-
-
-
-    wiki_hop_original_explain_relation.meta:   0%|          | 0.00/4.90k [00:00<?, ?B/s]
-
-
-
-    (…)final_step_of_the_following_process.meta:   0%|          | 0.00/4.96k [00:00<?, ?B/s]
-
-
-
-    wiki_qa_Is_This_True_.meta:   0%|          | 0.00/4.90k [00:00<?, ?B/s]
-
-
-
-    (…)_qa_droberta_answer_the_following_q.ckpt:   0%|          | 0.00/907k [00:00<?, ?B/s]
-
-
-
-    (…)1_11_description_question_option_id.ckpt:   0%|          | 0.00/907k [00:00<?, ?B/s]
-
-
-
-    duorc_SelfRC_question_answering.ckpt:   0%|          | 0.00/907k [00:00<?, ?B/s]
-
-
-
-    (…)l_description_context_question_text.ckpt:   0%|          | 0.00/907k [00:00<?, ?B/s]
-
-
-
-    sciq_Multiple_Choice.ckpt:   0%|          | 0.00/907k [00:00<?, ?B/s]
-
-
-
-    wiki_hop_original_explain_relation.ckpt:   0%|          | 0.00/907k [00:00<?, ?B/s]
-
-
-
-    wiki_qa_Is_This_True_.ckpt:   0%|          | 0.00/907k [00:00<?, ?B/s]
-
-
-
-    (…)final_step_of_the_following_process.ckpt:   0%|          | 0.00/907k [00:00<?, ?B/s]
-
 
     Expert:  adversarial_qa_droberta_answer_the_following_q  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
     Expert:  cos_e_v1_11_description_question_option_id  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
     Expert:  duorc_SelfRC_question_answering  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
     Expert:  quail_description_context_question_text  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
+    Expert:  race_high_Select_the_best_answer  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
+    Expert:  race_high_Select_the_best_answer_generate_span_  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
     Expert:  sciq_Multiple_Choice  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
     Expert:  wiki_hop_original_explain_relation  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
     Expert:  wiki_qa_Is_This_True_  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
     Expert:  wiqa_what_is_the_final_step_of_the_following_process  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
+    Experts in library: 10
 
 
-Ok, this library contains 8 LoRA experts!
+Ok, this library contains 10 LoRA experts!
 
 # Model-Based Clustering
 
@@ -172,11 +139,12 @@ k = 2
 
 cfg = MBClusteringTransformConfig(k=k, sparsity_threshold=sparsity)
 transform = MBCWithCosSimTransform(cfg)
-clusters = transform.transform(library, recompute=True)
+clusters: dict = transform.transform(library, recompute=True)
 
-# json object containing task names for each cluster
-print("First cluster: ", clusters["cluster_0"])
-print("Second cluster: ", clusters["cluster_1"])
+# `clusters` is a dict containing task names for each cluster
+for cluster in clusters:
+    print("Cluster: ", cluster)
+    print("Experts: ", clusters[cluster])
 
 with open("mbc_clusters.json", "w") as f:
     import json
@@ -184,92 +152,54 @@ with open("mbc_clusters.json", "w") as f:
     json.dump(clusters, f)
 ```
 
-
-    tokenizer_config.json:   0%|          | 0.00/26.0 [00:00<?, ?B/s]
-
-
-
-    config.json:   0%|          | 0.00/665 [00:00<?, ?B/s]
-
-
-
-    vocab.json:   0%|          | 0.00/1.04M [00:00<?, ?B/s]
-
-
-
-    merges.txt:   0%|          | 0.00/456k [00:00<?, ?B/s]
-
-
-
-    tokenizer.json:   0%|          | 0.00/1.36M [00:00<?, ?B/s]
-
-
-    /usr/local/lib/python3.10/dist-packages/transformers/tokenization_utils_base.py:1601: FutureWarning: `clean_up_tokenization_spaces` was not set. It will be set to `True` by default. This behavior will be depracted in transformers v4.45, and will be then set to `False` by default. For more details check this issue: https://github.com/huggingface/transformers/issues/31884
-      warnings.warn(
-    WARNING:mttl:VLLM is not installed. Please install it with `pip install -e ".[vllm]"` to use LLMEngine.
-    100%|██████████| 8/8 [00:00<00:00, 36.39it/s]
-
-
-    First cluster:  ['adversarial_qa_droberta_answer_the_following_q', 'duorc_SelfRC_question_answering', 'quail_description_context_question_text', 'sciq_Multiple_Choice', 'wiki_hop_original_explain_relation']
-    Second cluster:  ['cos_e_v1_11_description_question_option_id', 'wiki_qa_Is_This_True_', 'wiqa_what_is_the_final_step_of_the_following_process']
-
-
 After clustering, we can train join experts on similar tasks. This will increase transfer and reduce interference! To do so, we can use the `train_experts.py` script included in the repository. This will take some time, so feel free to skip this step (we provide another MBC library!)
 
 
 ```python
-#############################
-# OPTIONAL -- DO NOT EXECUTE
-#############################
-
-%%bash
-
-# Train expert for cluster 0
-python mttl/projects/modular_llm/train_experts.py \
-    -c mttl/projects/modular_llm/configs/models/gptneo_125m_fast.json \
-    -k finetune_task_name="cluster_0" \
-    expert_name="cluster_0" \
-    micro_batch_size=2 \
-    finetune_task_path="mbc_clusters.json" \
-    library_id="local://trained_gpt125m_mbc_experts_colab"
-
-# Train expert for cluster 1
-python mttl/projects/modular_llm/train_experts.py \
-    -c mttl/projects/modular_llm/configs/models/gptneo_125m_fast.json \
-    -k finetune_task_name="cluster_1" \
-    expert_name="cluster_1" \
-    micro_batch_size=2 \
-    finetune_task_path="mbc_clusters.json" \
-    library_id="local://trained_gpt125m_mbc_experts_colab"
-```
+import copy
+from mttl.logging import setup_logging
 
 
-```python
-if not os.path.exists("trained_gpt125m_mbc_experts_colab"):
-    mbc_library = ExpertLibrary.get_expert_library("hf://sordonia/trained_gpt125m_mbc_experts_colab").clone("local://trained_gpt125m_mbc_experts_colab")
+if train_library:
+    train_mbc_config = copy.deepcopy(train_config)
+
+    mbc_library = ExpertLibrary.get_expert_library("local://trained_gpt125m_mbc_experts_colab", create=True)
+
+    for cluster in clusters:
+        print("Fine-tuning on cluster: ", cluster, " with tasks: ", clusters[cluster])
+
+        # set the task name to the task we want to finetune on
+        train_mbc_config.finetune_task_name = ",".join(clusters[cluster])
+
+
+        # initialize an expert model
+        model = ExpertModel(
+            ExpertModelConfig(
+                base_model=train_mbc_config.model,
+                expert_name=cluster,
+                task_name=train_mbc_config.finetune_task_name,
+                modifier_config=train_mbc_config.modifier_config,
+            ),
+            device_map="cuda",
+            precision=train_mbc_config.precision,
+        )
+
+        # minimal training code to finetune the model on examples from the task
+        print(train_mbc_config.finetune_task_name)
+        dm = get_datamodule(train_mbc_config)
+        print(len(dm.train_dataset) // train_mbc_config.train_batch_size)
+        train_model(train_mbc_config, model, dm)
+
+        # add the expert to the library!
+        expert_instance = model.as_expert(training_config=train_mbc_config.to_dict())
+        mbc_library.add_expert(expert_instance, force=True)
 else:
-    mbc_library = ExpertLibrary.get_expert_library("local://trained_gpt125m_mbc_experts_colab")
+    mbc_library = ExpertLibrary.get_expert_library("hf://sordonia/trained_gpt125m_mbc_experts_colab").clone("local://trained_gpt125m_mbc_experts_colab")
 
 # Let's see which experts are in the library... :-)
 for expert_name in mbc_library.keys():
     print("Expert: ", expert_name, " with config: ", mbc_library[expert_name].expert_config)
 ```
-
-
-    cluster_1.meta:   0%|          | 0.00/5.15k [00:00<?, ?B/s]
-
-
-
-    cluster_0.meta:   0%|          | 0.00/5.28k [00:00<?, ?B/s]
-
-
-
-    cluster_0.ckpt:   0%|          | 0.00/907k [00:00<?, ?B/s]
-
-
-
-    cluster_1.ckpt:   0%|          | 0.00/907k [00:00<?, ?B/s]
-
 
     Expert:  cluster_0  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
     Expert:  cluster_1  with config:  LoRAConfig(modify_modules='.*', modify_layers='q_proj|v_proj|k_proj', tie_params=None, lora_rank=4, lora_alpha=1.0, lora_dropout=0.0, lora_init_b_random=False)
@@ -289,6 +219,7 @@ We will compare Rouge-L for:
 
 ```python
 import torch
+import copy
 from mttl.arguments import ExpertConfig
 from mttl.datamodule.base import get_datamodule
 from mttl.models.containers.selectors import TaskNameSelectorConfig, ArrowSelectorConfig
@@ -299,23 +230,28 @@ from mttl.evaluators.rouge_evaluator import RougeEvaluator
 from mttl.models.library.expert_library import ExpertLibrary
 
 
-config = ExpertConfig.from_json("mttl/projects/modular_llm/configs/models/gptneo_125m_fast.json")
-config.finetune_task_name = ",".join([
-    "wiqa_what_is_the_final_step_of_the_following_process,sciq_Multiple_Choice",
+eval_config = copy.deepcopy(train_config)
+
+# let's eval on all the 8 tasks
+eval_config.finetune_task_name = ",".join([
+    "wiqa_what_is_the_final_step_of_the_following_process",
+    "sciq_Multiple_Choice",
     "adversarial_qa_droberta_answer_the_following_q",
     "duorc_SelfRC_question_answering",
     "cos_e_v1_11_description_question_option_id",
+    "race_high_Select_the_best_answer",
+    "race_high_Select_the_best_answer_generate_span_",
     "wiki_qa_Is_This_True_",
     "quail_description_context_question_text",
     "wiki_hop_original_explain_relation"
 ])
-datamodule = get_datamodule(config, for_generation=True)
+datamodule = get_datamodule(eval_config, for_generation=True)
 evaluator = RougeEvaluator(datamodule)
 device_map="cuda" if torch.cuda.is_available() else "cpu"
 
 print("Test examples:", len(datamodule.test_dataset))
 
-# the oracle model uses the "task name" to generate!
+# the oracle model uses the "task name" in the forward pass, the task name is passed by the dataloader
 model = MultiExpertModel.from_pretrained_library(
     "local://trained_gpt125m_experts_colab",
     selector_config=TaskNameSelectorConfig(),
@@ -323,14 +259,15 @@ model = MultiExpertModel.from_pretrained_library(
 )
 oracle_rouge = evaluator.evaluate(model, split="test")
 
-# now replace selector for lora
+# now replace selector for lora to a uniform merging of experts during the forward pass
+# no task information is used!
 model.set_selector("lora", UniformSelectorConfig())
-
 # save model + selector for future re-use
 model.save_pretrained("./trained_gpt125m_uniform_model")
 uniform_rouge = evaluator.evaluate(model, split="test")
 
-# the oracle model uses the "task name" to generate!
+# Now let's test MBC experts that leverage certain multi-task training
+# the oracle
 model = MultiExpertModel.from_pretrained_library(
     "local://trained_gpt125m_mbc_experts_colab",
     selector_config=TaskNameSelectorConfig(),
@@ -341,6 +278,37 @@ oracle_mbc_rouge = evaluator.evaluate(model, split="test")
 model.set_selector("lora", UniformSelectorConfig())
 uniform_mbc_rouge = evaluator.evaluate(model, split="test")
 ```
+
+    /usr/local/lib/python3.10/dist-packages/torch/utils/data/dataloader.py:617: UserWarning: This DataLoader will create 8 worker processes in total. Our suggested max number of worker in current system is 2, which is smaller than what this DataLoader is going to create. Please be aware that excessive worker creation might get DataLoader running slow or even freeze, lower the worker number to avoid potential slowness/freeze if necessary.
+      warnings.warn(
+
+
+    Test examples: 80
+
+
+
+    Adding experts...:   0%|          | 0/10 [00:00<?, ?expert/s]
+
+
+
+      0%|          | 0/10 [00:00<?, ?it/s]
+
+
+
+      0%|          | 0/10 [00:00<?, ?it/s]
+
+
+
+    Adding experts...:   0%|          | 0/2 [00:00<?, ?expert/s]
+
+
+
+      0%|          | 0/10 [00:00<?, ?it/s]
+
+
+
+      0%|          | 0/10 [00:00<?, ?it/s]
+
 
 
 
@@ -356,7 +324,7 @@ plt.show()
 
 
     
-![png](mbc_arrow_tutorial_files/mbc_arrow_tutorial_14_0.png)
+![png](pg_mbc_arrow_tutorial_files/pg_mbc_arrow_tutorial_12_0.png)
     
 
 
@@ -369,18 +337,17 @@ Arrow selects experts that have "something to say" about a given input: we will 
 
 
 ```python
-from mttl.models.library.library_transforms import ArrowConfig, ArrowTransform
+from mttl.models.library.library_transforms import ArrowTransformConfig, ArrowTransform
 from mttl.models.containers.selectors import ArrowSelectorConfig
 
-
-arrow_transform_config = ArrowConfig()
-arrow_transform = ArrowTransform(arrow_config)
+arrow_transform_config = ArrowTransformConfig()
+arrow_transform = ArrowTransform(arrow_transform_config)
 
 # persist the prototypes in the library using arrow_transform_config.name
 arrow_transform.transform("local://trained_gpt125m_experts_colab", persist=True)
 
 # we inform the selector that we have to read the prototypes corresponding to our config
-arrow_selector_config = ArrowSelectorConfig(top_k=2, selector_data_id=arrow_transform_config.name)
+arrow_selector_config = ArrowSelectorConfig(top_k=2, selector_data_id=arrow_transform_config.save_name)
 
 model = MultiExpertModel.from_pretrained_library(
     "local://trained_gpt125m_experts_colab",
@@ -394,7 +361,7 @@ arrow_rouge = evaluator.evaluate(model, split="test")
 # do the same for MBC library
 arrow_transform.transform("local://trained_gpt125m_mbc_experts_colab", persist=True)
 # we inform the selector that we have to read the prototypes corresponding to our config
-arrow_selector_config = ArrowSelectorConfig(top_k=2, selector_data_id=arrow_transform_config.name)
+arrow_selector_config = ArrowSelectorConfig(top_k=2, selector_data_id=arrow_transform_config.save_name)
 model = MultiExpertModel.from_pretrained_library(
     "local://trained_gpt125m_mbc_experts_colab",
     selector_config=arrow_selector_config,
@@ -403,10 +370,20 @@ model = MultiExpertModel.from_pretrained_library(
 arrow_mbc_rouge = evaluator.evaluate(model, split="test")
 ```
 
-    Adding experts...: 100%|██████████| 8/8 [00:00<00:00, 23.00expert/s]
-    rougeL: 17.0833: 100%|██████████| 1/1 [00:21<00:00, 21.62s/it]
-    Adding experts...: 100%|██████████| 2/2 [00:00<00:00, 19.56expert/s]
-    rougeL: 12.9464: 100%|██████████| 1/1 [00:17<00:00, 17.87s/it]
+
+    Adding experts...:   0%|          | 0/10 [00:00<?, ?expert/s]
+
+
+
+      0%|          | 0/10 [00:00<?, ?it/s]
+
+
+
+    Adding experts...:   0%|          | 0/2 [00:00<?, ?expert/s]
+
+
+
+      0%|          | 0/10 [00:00<?, ?it/s]
 
 
 
@@ -429,11 +406,265 @@ plt.show()
 
 
     
-![png](mbc_arrow_tutorial_files/mbc_arrow_tutorial_18_0.png)
+![png](pg_mbc_arrow_tutorial_files/pg_mbc_arrow_tutorial_16_0.png)
     
 
 
 We can see that Arrow greatly fills the gap w.r.t. oracle routing for the private library; conversely for the MBC library it seems to suffer a bit w.r.t. a standard uniform merging of the experts.. Too much interference in the prototypes?
+
+# PhatGOOSE Routing
+
+
+```python
+# Comuting PhatGoose embeddings will take some time as PhatGOOSE requires a few gradient steps for each expert to train the prototypes
+# there will be one optimization per expert, so 10 optimizations in total
+
+from mttl.models.library.library_transforms import PhatgooseTransformConfig, PhatgooseTransform
+from mttl.models.containers.selectors import PhatgooseSelectorConfig
+
+pg_config = PhatgooseTransformConfig(n_steps=50, learning_rate=1e-3, warmup_ratio=0.0)
+pg_transform = PhatgooseTransform(pg_config)
+
+pg_transform.transform("local://trained_gpt125m_experts_colab", persist=True)
+
+# persist the prototypes in the library using pg_config.save_name
+pg_selector_config = PhatgooseSelectorConfig(top_k=2, selector_data_id=pg_config.save_name)
+
+model = MultiExpertModel.from_pretrained_library(
+    "local://trained_gpt125m_experts_colab",
+    selector_config=pg_selector_config,
+    device_map="cuda"
+)
+# save pg model for later!
+model.save_pretrained("./trained_gpt125m_pg_model")
+pg_rouge = evaluator.evaluate(model, split="test")
+
+pg_transform.transform("local://trained_gpt125m_mbc_experts_colab", persist=True)
+
+# we inform the selector that we have to read the prototypes corresponding to our config
+model = MultiExpertModel.from_pretrained_library(
+    "local://trained_gpt125m_mbc_experts_colab",
+    selector_config=pg_selector_config,
+    device_map="cuda"
+)
+pg_mbc_rouge = evaluator.evaluate(model, split="test")
+```
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+    Filtering task names (num_proc=16):   0%|          | 0/26400 [00:00<?, ? examples/s]
+
+
+
+    Creating train set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating valid set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating test set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+    Filtering task names (num_proc=16):   0%|          | 0/26400 [00:00<?, ? examples/s]
+
+
+
+    Creating train set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating valid set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating test set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+    Filtering task names (num_proc=16):   0%|          | 0/26400 [00:00<?, ? examples/s]
+
+
+
+    Creating train set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating valid set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating test set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+    Filtering task names (num_proc=16):   0%|          | 0/26400 [00:00<?, ? examples/s]
+
+
+
+    Creating train set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating valid set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating test set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+    Filtering task names (num_proc=16):   0%|          | 0/26400 [00:00<?, ? examples/s]
+
+
+
+    Creating train set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating valid set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating test set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+    Filtering task names (num_proc=16):   0%|          | 0/26400 [00:00<?, ? examples/s]
+
+
+
+    Creating train set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating valid set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+    Creating test set (num_proc=16):   0%|          | 0/100 [00:00<?, ? examples/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+    Adding experts...:   0%|          | 0/10 [00:00<?, ?expert/s]
+
+
+
+      0%|          | 0/10 [00:00<?, ?it/s]
+
+
+
+    Filtering task names (num_proc=16):   0%|          | 0/26400 [00:00<?, ? examples/s]
+
+
+
+    Creating train set (num_proc=16):   0%|          | 0/500 [00:00<?, ? examples/s]
+
+
+
+    Creating valid set (num_proc=16):   0%|          | 0/500 [00:00<?, ? examples/s]
+
+
+
+    Creating test set (num_proc=16):   0%|          | 0/500 [00:00<?, ? examples/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+    Filtering task names (num_proc=16):   0%|          | 0/26400 [00:00<?, ? examples/s]
+
+
+
+    Creating train set (num_proc=16):   0%|          | 0/500 [00:00<?, ? examples/s]
+
+
+
+    Creating valid set (num_proc=16):   0%|          | 0/500 [00:00<?, ? examples/s]
+
+
+
+    Creating test set (num_proc=16):   0%|          | 0/500 [00:00<?, ? examples/s]
+
+
+
+      0%|          | 0/50 [00:00<?, ?it/s]
+
+
+
+    Adding experts...:   0%|          | 0/2 [00:00<?, ?expert/s]
+
+
+
+      0%|          | 0/10 [00:00<?, ?it/s]
+
+
+
+```python
+# Let's redo some plots
+
+import matplotlib.pyplot as plt
+
+x_values = ["oracle", "uniform", "arrow", "pg", "oracle_mbc", "uniform_mbc", "arrow_mbc", "pg_mbc"]
+y_values = [
+    oracle_rouge, uniform_rouge, arrow_rouge, pg_rouge,
+    oracle_mbc_rouge, uniform_mbc_rouge, arrow_mbc_rouge, pg_mbc_rouge
+]
+colors = ["blue", "blue", "red", "purple", "blue", "blue", "red", "purple"]
+
+plt.figure(figsize=(12, 6))
+plt.bar(x_values, y_values, color=colors)
+plt.show()
+```
+
+
+    
+![png](pg_mbc_arrow_tutorial_files/pg_mbc_arrow_tutorial_20_0.png)
+    
+
 
 # Downstream Evaluation
 
@@ -449,12 +680,12 @@ evaluation_task = "arc-easy"
 
 with torch.no_grad():
     runner: EvaluatorRunner = setup_evaluators(
-        model_type=config.model,
-        model_family=config.model_family,
-        max_input_length=config.max_input_length,
-        max_output_length=config.max_output_length,
-        predict_batch_size=config.predict_batch_size,
-        truncation_side=config.truncation_side,
+        model_type=train_config.model,
+        model_family=train_config.model_family,
+        max_input_length=train_config.max_input_length,
+        max_output_length=train_config.max_output_length,
+        predict_batch_size=train_config.predict_batch_size,
+        truncation_side=train_config.truncation_side,
         tasks=evaluation_task
     )
 
@@ -470,15 +701,81 @@ uniform_perf = runner.run(model)
 # arrowed private model
 model = MultiExpertModel.from_pretrained("./trained_gpt125m_arrow_model", device_map="cuda", precision="32")
 arrow_perf = runner.run(model)
+
+# pg private model
+model = MultiExpertModel.from_pretrained("./trained_gpt125m_pg_model", device_map="cuda", precision="32")
+pg_perf = runner.run(model)
 ```
 
 
+    README.md:   0%|          | 0.00/9.00k [00:00<?, ?B/s]
+
+
+
+    train-00000-of-00001.parquet:   0%|          | 0.00/331k [00:00<?, ?B/s]
+
+
+
+    test-00000-of-00001.parquet:   0%|          | 0.00/346k [00:00<?, ?B/s]
+
+
+
+    validation-00000-of-00001.parquet:   0%|          | 0.00/86.1k [00:00<?, ?B/s]
+
+
+
+    Generating train split:   0%|          | 0/2251 [00:00<?, ? examples/s]
+
+
+
+    Generating test split:   0%|          | 0/2376 [00:00<?, ? examples/s]
+
+
+
+    Generating validation split:   0%|          | 0/570 [00:00<?, ? examples/s]
+
+
+
+    Map (num_proc=16):   0%|          | 0/2251 [00:00<?, ? examples/s]
+
+
+
+    Map (num_proc=16):   0%|          | 0/2376 [00:00<?, ? examples/s]
+
+
+
+    Map (num_proc=16):   0%|          | 0/570 [00:00<?, ? examples/s]
+
+
+
+      0%|          | 0/297 [00:00<?, ?it/s]
+
+
+
+      0%|          | 0/297 [00:00<?, ?it/s]
+
+
+    WARNING:mttl:Library artifacts not loaded for ArrowSelector, using zero initialization.
+
+
+
+      0%|          | 0/297 [00:00<?, ?it/s]
+
+
+    WARNING:mttl:Library artifacts not loaded for PhatgooseSelector, using zero initialization.
+
+
+
+      0%|          | 0/297 [00:00<?, ?it/s]
+
+
+
 ```python
-x_values = ["base", "uniform", "arrow"]
+x_values = ["base", "uniform", "arrow", "pg"]
 y_values = [
-    base_perf['mean'], uniform_perf['mean'], arrow_perf['mean']
+    base_perf['mean'], uniform_perf['mean'], arrow_perf['mean'], pg_perf['mean']
 ]
-colors = ["blue", "blue", "red"]
+colors = ["blue", "blue", "red", "purple"]
 
 plt.figure()
 plt.bar(x_values, y_values, color=colors)
@@ -488,7 +785,7 @@ plt.show()
 
 
     
-![png](mbc_arrow_tutorial_files/mbc_arrow_tutorial_22_0.png)
+![png](pg_mbc_arrow_tutorial_files/pg_mbc_arrow_tutorial_23_0.png)
     
 
 
