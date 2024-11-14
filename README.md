@@ -205,14 +205,14 @@ for expert_name in mbc_library.keys():
 
 # In-Distribution Evaluation
 
-Let's evaluate both the private expert and the MBC experts on in-distribution tasks!
+Let's evaluate both the "private" experts and the MBC experts on in-distribution tasks!
 
 We will compare Rouge-L for:
 
-1) oracle routing: use the correct expert for each task \\
-2) the average task expert: just average experts for single tasks \\
-3) the oracle MBC expert: use the cluster expert trained on each task \\
-4) the average MBC expert: average MBC experts then evaluate on all the tasks \\
+1) oracle routing: use the correct expert for each task
+2) the average task expert: just average experts and use the resulting expert for all the tasks
+3) the oracle MBC expert: upon seeing a task, it uses the cluster expert comprising that task
+4) the average MBC expert: average MBC experts and use the resulting expert for all the tasks
 
 
 ```python
