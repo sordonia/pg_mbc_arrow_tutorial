@@ -673,7 +673,7 @@ We will now evaluate both the uniform merged model and the Arrow model on some d
 # let's try some out-of-distribution evaluation now!
 from mttl.evaluators.base import EvaluatorRunner, setup_evaluators
 
-# we will
+# we will run on Arc-Easy
 evaluation_task = "arc-easy"
 
 with torch.no_grad():
